@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BGMI ID Info API – Dynamic Region Detection (with built-in debug system)
-Fetches username from rooter.gg, region from player profile.
+Fetches username from rooter.gg.
 
 DEBUG USAGE
 -----------
@@ -24,7 +24,6 @@ import logging
 import traceback
 from urllib.parse import unquote
 from flask import Flask, request, jsonify
-from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
@@ -39,7 +38,16 @@ log = logging.getLogger("bgmi-api")
 # ---------- Config ----------
 CACHE_TTL = 300
 USER_CACHE = {}
-TOKEN_CACHE = {"token": None, "expires_at": 0}
+TOKEN_CACHE = {}  # site name -> {"token":..., "expires_at":...}
+
+# Rooter ke 2 front-ends. shop.rooter.gg naya store hai (jo dost ke phone me chal raha hai),
+# www.rooter.gg purana. Dono ko try karte hain, jo chale wo use hota hai.
+SITES = [
+    {"name": "shop", "home": "https://shop.rooter.gg/product/bgmi-uc-purchase",
+     "origin": "https://shop.rooter.gg", "referer": "https://shop.rooter.gg/"},
+    {"name": "www", "home": "https://www.rooter.gg/",
+     "origin": "https://www.rooter.gg", "referer": "https://www.rooter.gg/"},
+]
 DEBUG_KEY = os.environ.get("DEBUG_KEY")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -111,73 +119,84 @@ class Trace:
 
 
 # ======================================================================
-# Token (rooter.gg)
+# Token (rooter)
 # ======================================================================
-def get_authorization_token(session, trace, force_refresh=False):
-    global TOKEN_CACHE
+def extract_token(session):
+    """Cookies me se accessToken dhundo. 'user_auth' pehle, phir baaki sab cookies."""
+    names = ["user_auth"] + [n for n in session.cookies.keys() if n != "user_auth"]
+    for name in names:
+        raw = session.cookies.get(name)
+        if not raw:
+            continue
+        try:
+            data = json.loads(unquote(raw))
+        except Exception:
+            continue
+        if isinstance(data, dict) and data.get("accessToken"):
+            return data["accessToken"], name
+    return None, None
+
+
+def get_authorization_token(session, trace, site, force_refresh=False):
+    n = site["name"]
     now = time.time()
-    if not force_refresh and TOKEN_CACHE["token"] and TOKEN_CACHE["expires_at"] > now:
-        trace.add("token.cache", True, note="using cached token",
-                  token=mask(TOKEN_CACHE["token"]),
-                  expires_in_s=int(TOKEN_CACHE["expires_at"] - now))
-        return TOKEN_CACHE["token"]
+    cached = TOKEN_CACHE.get(n)
+    if not force_refresh and cached and cached["expires_at"] > now:
+        trace.add(f"{n}.token.cache", True, note="using cached token",
+                  token=mask(cached["token"]), expires_in_s=int(cached["expires_at"] - now))
+        return cached["token"]
 
     try:
-        url = "https://www.rooter.gg/"
         headers = {
             "User-Agent": UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        resp = session.get(url, headers=headers, timeout=10)
+        resp = session.get(site["home"], headers=headers, timeout=10)
         blocked = looks_blocked(resp)
-        trace.add("token.request", resp.status_code == 200 and not blocked,
-                  url=url, status=resp.status_code, final_url=resp.url,
+        trace.add(f"{n}.token.request", resp.status_code == 200 and not blocked,
+                  url=site["home"], status=resp.status_code, final_url=resp.url,
                   cookies_received=sorted(session.cookies.keys()),
                   blocked_hints=blocked or None,
-                  error=(f"rooter.gg ne block kiya: {blocked}" if blocked else None),
+                  error=(f"{n}: request block hui: {blocked}" if blocked else None),
                   body_preview=None if resp.status_code == 200 else snippet(resp.text))
 
-        user_auth = session.cookies.get("user_auth")
-        if not user_auth:
-            trace.add("token.cookie", False,
-                      error="'user_auth' cookie nahi mili — rooter.gg ne cookie dena band kiya ya "
-                            "request block hui (server/Vercel IP block ho sakta hai)",
+        token, cookie_name = extract_token(session)
+        if not token:
+            trace.add(f"{n}.token.cookie", False,
+                      error=f"{n}: kisi cookie me accessToken nahi mila "
+                            f"(server IP block ya site ne guest cookie dena band kiya)",
                       cookies_received=sorted(session.cookies.keys()))
             return None
 
-        try:
-            token_data = json.loads(unquote(user_auth))
-        except Exception as e:
-            trace.add("token.parse", False,
-                      error=f"user_auth cookie JSON parse fail: {e}",
-                      cookie_preview=snippet(unquote(user_auth), 120))
-            return None
-
-        token = token_data.get("accessToken")
-        if not token:
-            trace.add("token.parse", False,
-                      error="cookie mil gayi par 'accessToken' key nahi hai",
-                      keys_found=list(token_data.keys()) if isinstance(token_data, dict) else str(type(token_data)))
-            return None
-
-        TOKEN_CACHE["token"] = token
-        TOKEN_CACHE["expires_at"] = now + 3600
-        trace.add("token.parse", True, token=mask(token))
+        TOKEN_CACHE[n] = {"token": token, "expires_at": now + 3600}
+        trace.add(f"{n}.token.parse", True, token=mask(token), cookie=cookie_name)
         return token
 
     except Exception as e:
-        trace.add("token.exception", False, error=f"{type(e).__name__}: {e}")
-        log.error("Token fetch error: %s", e)
+        trace.add(f"{n}.token.exception", False, error=f"{type(e).__name__}: {e}")
+        log.error("Token fetch error (%s): %s", n, e)
         return None
 
 
 # ======================================================================
-# Username (rooter.gg)
+# Username (rooter)
 # ======================================================================
-def fetch_username(uid, trace):
+def api_error(resp):
+    """Rooter ke error body se asli message nikalo."""
+    try:
+        j = resp.json()
+        err = j.get("error") or j.get("data") or {}
+        return (f"rooter error: {j.get('message')} | statusCode={err.get('statusCode')} | "
+                f"{err.get('developerMessage') or j.get('developerMessage')}")
+    except Exception:
+        return f"HTTP {resp.status_code}"
+
+
+def fetch_username_from_site(uid, trace, site):
+    n = site["name"]
     session = requests.Session()
-    token = get_authorization_token(session, trace)
+    token = get_authorization_token(session, trace, site)
     if not token:
         return None
 
@@ -189,7 +208,8 @@ def fetch_username(uid, trace):
         "Device-Id": "api-service",
         "User-Agent": UA,
         "Accept": "application/json",
-        "Referer": "https://www.rooter.gg/",
+        "Origin": site["origin"],
+        "Referer": site["referer"],
     }
 
     def call():
@@ -197,97 +217,66 @@ def fetch_username(uid, trace):
 
     try:
         resp = call()
-        trace.add("username.request", resp.status_code == 200, url=url,
-                  status=resp.status_code,
-                  content_type=resp.headers.get("Content-Type"),
+        trace.add(f"{n}.username.request", resp.status_code == 200, url=url,
+                  status=resp.status_code, content_type=resp.headers.get("Content-Type"),
                   blocked_hints=looks_blocked(resp) or None,
+                  error=None if resp.status_code == 200 else api_error(resp),
                   body_preview=snippet(resp.text))
+
+        # 499 / 5xx = rooter ka upstream error, ek baar retry
+        if resp.status_code == 499 or resp.status_code >= 500:
+            time.sleep(1.5)
+            resp = call()
+            trace.add(f"{n}.username.retry_upstream", resp.status_code == 200,
+                      status=resp.status_code,
+                      error=None if resp.status_code == 200 else api_error(resp),
+                      body_preview=snippet(resp.text))
 
         # Token expire / invalid -> refresh once and retry
         if resp.status_code in (401, 403):
-            trace.add("username.token_refresh", True,
-                      note=f"HTTP {resp.status_code} aaya, token refresh karke retry")
-            token = get_authorization_token(session, trace, force_refresh=True)
+            token = get_authorization_token(session, trace, site, force_refresh=True)
             if not token:
                 return None
             headers["Authorization"] = f"Bearer {token}"
             resp = call()
-            trace.add("username.retry", resp.status_code == 200,
+            trace.add(f"{n}.username.retry_token", resp.status_code == 200,
                       status=resp.status_code, body_preview=snippet(resp.text))
 
         try:
             data = resp.json()
         except Exception as e:
-            trace.add("username.json", False,
-                      error=f"Response JSON nahi hai: {e}",
-                      body_preview=snippet(resp.text))
+            trace.add(f"{n}.username.json", False,
+                      error=f"Response JSON nahi hai: {e}", body_preview=snippet(resp.text))
             return None
 
         transaction = data.get("transaction") if isinstance(data, dict) else None
         if transaction == "SUCCESS":
             username = (data.get("unipinRes") or {}).get("username")
-            trace.add("username.result", bool(username),
-                      username=username,
+            trace.add(f"{n}.username.result", bool(username), username=username,
                       error=None if username else "SUCCESS aaya par 'unipinRes.username' empty hai",
                       raw=None if username else snippet(json.dumps(data), 400))
             return username
 
-        trace.add("username.result", False,
-                  error=f"API ne SUCCESS nahi diya (transaction={transaction!r}) — UID galat ho sakta hai "
-                        f"ya rooter ka response format badal gaya",
+        trace.add(f"{n}.username.result", False,
+                  error=f"{n}: SUCCESS nahi mila (transaction={transaction!r})",
                   raw=snippet(json.dumps(data), 400))
     except Exception as e:
-        trace.add("username.exception", False, error=f"{type(e).__name__}: {e}")
-        log.error("Username fetch error for %s: %s", uid, e)
+        trace.add(f"{n}.username.exception", False, error=f"{type(e).__name__}: {e}")
+        log.error("Username fetch error (%s) for %s: %s", n, uid, e)
     return None
 
 
-# ======================================================================
-# Region (bgmionline.in)
-# ======================================================================
-def fetch_region(uid, trace):
-    """Scrape bgmionline.in to get player's country/region."""
-    try:
-        url = f"https://bgmionline.in/player/{uid}"
-        resp = requests.get(url, headers={"User-Agent": UA}, timeout=10)
-        if resp.status_code != 200:
-            trace.add("region.request", False, url=url, status=resp.status_code,
-                      blocked_hints=looks_blocked(resp) or None,
-                      error=f"bgmionline.in ne HTTP {resp.status_code} diya",
-                      body_preview=snippet(resp.text))
-            return None
-        trace.add("region.request", True, url=url, status=200, html_bytes=len(resp.text))
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        flag = soup.find("img", src=re.compile(r"flag|country", re.I))
-        if flag and flag.get("alt"):
-            region = flag["alt"].strip()
-            trace.add("region.parse", True, method="flag_img_alt", region=region)
-            return region
-
-        for elem in soup.find_all(string=True):
-            txt = elem.strip()
-            if txt and ("country" in txt.lower() or "region" in txt.lower()):
-                parent = elem.parent
-                if parent:
-                    full = parent.get_text(strip=True)
-                    match = re.search(r"[Cc]ountry\s*[:.]?\s*([A-Za-z\s]+)", full)
-                    if match:
-                        region = match.group(1).strip()
-                        trace.add("region.parse", True, method="country_text", region=region)
-                        return region
-
-        trace.add("region.parse", False,
-                  error="Page mila par region/flag nahi mila — site ka HTML badal gaya ya "
-                        "player page JS se load hota hai. Default 'India' use hoga.",
-                  page_title=soup.title.string.strip() if soup.title and soup.title.string else None,
-                  body_preview=snippet(soup.get_text(" ", strip=True), 200))
-        return None
-    except Exception as e:
-        trace.add("region.exception", False, error=f"{type(e).__name__}: {e}")
-        log.error("Region fetch error for %s: %s", uid, e)
-        return None
+def fetch_username(uid, trace):
+    """Sab SITES try karo. Jo pehle chale uska username return. probe=1 me sab try hote hain."""
+    found = None
+    for site in SITES:
+        username = fetch_username_from_site(uid, trace, site)
+        if username:
+            trace.add("username.source", True, site=site["name"], username=username)
+            found = found or username
+            if not getattr(trace, "try_all", False):
+                break
+    return found
 
 
 # ======================================================================
@@ -301,7 +290,6 @@ def get_player_info(uid, trace, use_cache=True):
     trace.add("cache.miss", True, uid=uid)
 
     username = fetch_username(uid, trace)
-    region = fetch_region(uid, trace)
 
     if not username:
         # Fail ko cache NAHI karte, warna 5 minute tak galat "Unknown" milta rahega
@@ -320,7 +308,8 @@ def get_player_info(uid, trace, use_cache=True):
         "username": username,
         "uid": uid,
         "server": "BGMI",
-        "region": region or "India",
+        "region": "India",  # BGMI_IN = India server
+        
     }
     USER_CACHE[uid] = {"data": result, "timestamp": now}
     return result
@@ -398,6 +387,7 @@ def debug_endpoint():
         return jsonify({"success": False, "error": "UID must be numeric"}), 400
 
     trace = Trace()
+    trace.try_all = request.args.get("probe", "1") != "0"  # debug me default sab sites try
     result = get_player_info(uid, trace, use_cache=False)
 
     return jsonify({
@@ -413,15 +403,15 @@ def debug_endpoint():
             "debug_key_set": bool(DEBUG_KEY),
         },
         "cache": {
-            "token_cached": bool(TOKEN_CACHE["token"]),
-            "token": mask(TOKEN_CACHE["token"]),
-            "token_expires_in_s": max(0, int(TOKEN_CACHE["expires_at"] - time.time())),
+            "tokens": {k: {"token": mask(v["token"]),
+                           "expires_in_s": max(0, int(v["expires_at"] - time.time()))}
+                       for k, v in TOKEN_CACHE.items()},
             "users_cached": len(USER_CACHE),
         },
         "connectivity": [
+            check_host("https://shop.rooter.gg/"),
             check_host("https://www.rooter.gg/"),
             check_host("https://bazaar.rooter.io/"),
-            check_host("https://bgmionline.in/"),
         ],
     }), 200
 
