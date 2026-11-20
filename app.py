@@ -40,13 +40,11 @@ CACHE_TTL = 300
 USER_CACHE = {}
 TOKEN_CACHE = {}  # site name -> {"token":..., "expires_at":...}
 
-# Rooter ke 2 front-ends. shop.rooter.gg naya store hai (jo dost ke phone me chal raha hai),
-# www.rooter.gg purana. Dono ko try karte hain, jo chale wo use hota hai.
+# Rooter ka naya store. Purana www.rooter.gg ab username endpoint pe 499 deta hai (debug se confirm),
+# isliye hata diya. Zaroorat pade to yahan dobara dict add kar sakte ho (fallback apne aap kaam karega).
 SITES = [
     {"name": "shop", "home": "https://shop.rooter.gg/product/bgmi-uc-purchase",
      "origin": "https://shop.rooter.gg", "referer": "https://shop.rooter.gg/"},
-    {"name": "www", "home": "https://www.rooter.gg/",
-     "origin": "https://www.rooter.gg", "referer": "https://www.rooter.gg/"},
 ]
 DEBUG_KEY = os.environ.get("DEBUG_KEY")
 
