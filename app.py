@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
 """
-BGMI ID Info API – Dynamic Region Detection (with built-in debug system)
-Fetches username from rooter.gg.
+BGMI ID Info API  (Rooter shop /validate endpoint, guest-token first)
 
-DEBUG USAGE
------------
-  /api/bgmi?uid=<UID>&debug=1     -> normal result + full step-by-step trace
-  /api/debug?uid=<UID>            -> trace + environment + connectivity checks
-  /health                         -> quick liveness check
+  /api/bgmi?uid=<UID>             -> {"success":true,"username":...}
+  /api/bgmi?uid=<UID>&debug=1&key=<DEBUG_KEY>   -> + step-by-step trace
+  /api/debug?uid=<UID>&key=<DEBUG_KEY>          -> trace + env + connectivity
+  /health
 
-Env vars (optional):
-  DEBUG_KEY  -> if set, debug endpoints need  &key=<DEBUG_KEY>
-  LOG_LEVEL  -> DEBUG / INFO / WARNING (default INFO). Logs show in Vercel > Logs.
+Flow
+  1. Rooter shop page se guest token (cookie `user_auth`) lo
+  2. POST https://shop.rooter.io/v1/users/games/BGMI/validate
+  3. Guest token reject ho (401/403) to ek baar fresh guest token,
+     phir (agar set ho) ROOTER_TOKEN (logged-in account) pe fallback
+
+Env vars (Vercel > Settings > Environment Variables)
+  DEBUG_KEY      -> debug endpoints is key ke bina band rahenge (set karna zaroori)
+  ROOTER_TOKEN   -> OPTIONAL fallback. accessToken ya poori user_auth cookie value
+  DEVICE_ID      -> OPTIONAL, fixed UUID. Na ho to ek random UUID per instance
+  PRODUCT_ID / SELLER_ID / VARIATION_ID -> OPTIONAL, defaults neeche hain
+  LOG_LEVEL      -> DEBUG / INFO / WARNING
 """
 
-import requests
+import base64
 import json
-import time
-import re
+import logging
 import os
 import sys
-import logging
+import time
 import traceback
+import uuid
 from urllib.parse import unquote
-from flask import Flask, request, jsonify
+
+import requests
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-# ---------- Logging ----------
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -37,26 +45,30 @@ log = logging.getLogger("bgmi-api")
 
 # ---------- Config ----------
 CACHE_TTL = 300
-USER_CACHE = {}
-TOKEN_CACHE = {}  # site name -> {"token":..., "expires_at":...}
+USER_CACHE = {}          # uid -> {"data":..., "timestamp":...}
+GUEST = {}               # {"token":..., "expires_at":..., "client_id":...}
 
-# Rooter ka naya store. Purana www.rooter.gg ab username endpoint pe 499 deta hai (debug se confirm),
-# isliye hata diya. Zaroorat pade to yahan dobara dict add kar sakte ho (fallback apne aap kaam karega).
-SITES = [
-    {"name": "shop", "home": "https://shop.rooter.gg/product/bgmi-uc-purchase",
-     "origin": "https://shop.rooter.gg", "referer": "https://shop.rooter.gg/"},
-]
+SHOP_HOME = "https://shop.rooter.gg/product/bgmi-uc-purchase"
+ORIGIN = "https://shop.rooter.gg"
+REFERER = "https://shop.rooter.gg/"
+VALIDATE_URL = "https://shop.rooter.io/v1/users/games/BGMI/validate"
+
+# BGMI UC product ke IDs (HAR se). Product badle to env var se override karo.
+PRODUCT_ID = os.environ.get("PRODUCT_ID", "68b68cd040686941011133fd")
+SELLER_ID = os.environ.get("SELLER_ID", "68b674c47b5553796f3f2035")
+VARIATION_ID = os.environ.get("VARIATION_ID", "68b68cd04068694101113403")
+
 DEBUG_KEY = os.environ.get("DEBUG_KEY")
+DEVICE_ID = os.environ.get("DEVICE_ID") or str(uuid.uuid1())
 
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+UA = ("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36")
 
 
 # ======================================================================
-# Debug helpers
+# Helpers
 # ======================================================================
 def snippet(text, n=300):
-    """Short, single-line preview of a response body."""
     if text is None:
         return None
     text = str(text).replace("\n", " ").replace("\r", " ")
@@ -64,14 +76,33 @@ def snippet(text, n=300):
 
 
 def mask(token):
-    """Never expose a full token in debug output."""
     if not token:
         return None
     return f"{token[:6]}…{token[-4:]} (len={len(token)})"
 
 
+def jwt_claims(token):
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def jwt_info(token):
+    c = jwt_claims(token)
+    if not c:
+        return {"error": "JWT parse nahi hua"}
+    now = time.time()
+    out = {"verified_user": c.get("isVerified")}
+    if "exp" in c:
+        out["exp_in_s"] = int(c["exp"] - now)
+    return out
+
+
 def looks_blocked(resp):
-    """Detect Cloudflare / bot-protection / rate-limit pages."""
     body = (resp.text or "")[:2000].lower()
     hints = []
     if resp.status_code in (403, 429, 503):
@@ -84,28 +115,21 @@ def looks_blocked(resp):
 
 
 class Trace:
-    """Collects every step of a request so we can see exactly where it breaks."""
+    """Har step ka record, taaki pata chale kaha toota."""
 
     def __init__(self):
         self.steps = []
         self.t0 = time.time()
 
     def add(self, step, ok, **info):
-        entry = {
-            "step": step,
-            "ok": ok,
-            "t_ms": int((time.time() - self.t0) * 1000),
-        }
+        entry = {"step": step, "ok": ok, "t_ms": int((time.time() - self.t0) * 1000)}
         entry.update({k: v for k, v in info.items() if v is not None})
         self.steps.append(entry)
-        level = logging.INFO if ok else logging.WARNING
-        log.log(level, "[%s] ok=%s %s", step, ok, json.dumps(info, default=str)[:500])
+        log.log(logging.INFO if ok else logging.WARNING, "[%s] ok=%s %s",
+                step, ok, json.dumps(info, default=str)[:500])
 
     def first_failure(self):
-        for s in self.steps:
-            if not s["ok"]:
-                return s
-        return None
+        return next((s for s in self.steps if not s["ok"]), None)
 
     def to_dict(self):
         fail = self.first_failure()
@@ -117,213 +141,217 @@ class Trace:
 
 
 # ======================================================================
-# Token (rooter)
+# Tokens
 # ======================================================================
-def extract_token(session):
-    """Cookies me se accessToken dhundo. 'user_auth' pehle, phir baaki sab cookies."""
-    names = ["user_auth"] + [n for n in session.cookies.keys() if n != "user_auth"]
-    for name in names:
-        raw = session.cookies.get(name)
-        if not raw:
-            continue
-        try:
-            data = json.loads(unquote(raw))
-        except Exception:
-            continue
-        if isinstance(data, dict) and data.get("accessToken"):
-            return data["accessToken"], name
-    return None, None
-
-
-def get_authorization_token(session, trace, site, force_refresh=False):
-    n = site["name"]
-    now = time.time()
-    cached = TOKEN_CACHE.get(n)
-    if not force_refresh and cached and cached["expires_at"] > now:
-        trace.add(f"{n}.token.cache", True, note="using cached token",
-                  token=mask(cached["token"]), expires_in_s=int(cached["expires_at"] - now))
-        return cached["token"]
-
+def _token_from_cookie_value(raw):
     try:
-        headers = {
+        data = json.loads(unquote(raw))
+        if isinstance(data, dict):
+            return data.get("accessToken")
+    except Exception:
+        pass
+    return None
+
+
+def get_guest_token(trace, force=False):
+    """Shop page kholo, `user_auth` cookie me guest accessToken milta hai."""
+    now = time.time()
+    if not force and GUEST.get("token") and GUEST["expires_at"] > now:
+        trace.add("guest.cache", True, token=mask(GUEST["token"]),
+                  expires_in_s=int(GUEST["expires_at"] - now))
+        return GUEST["token"], GUEST.get("client_id")
+
+    session = requests.Session()
+    try:
+        resp = session.get(SHOP_HOME, headers={
             "User-Agent": UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-        }
-        resp = session.get(site["home"], headers=headers, timeout=10)
+        }, timeout=10)
         blocked = looks_blocked(resp)
-        trace.add(f"{n}.token.request", resp.status_code == 200 and not blocked,
-                  url=site["home"], status=resp.status_code, final_url=resp.url,
-                  cookies_received=sorted(session.cookies.keys()),
+        raw = session.cookies.get("user_auth")
+        token = _token_from_cookie_value(raw) if raw else None
+        client_id = session.cookies.get("client_id")
+        ok = resp.status_code == 200 and bool(token)
+        trace.add("guest.fetch", ok, status=resp.status_code,
+                  cookies=sorted(session.cookies.keys()),
                   blocked_hints=blocked or None,
-                  error=(f"{n}: request block hui: {blocked}" if blocked else None),
-                  body_preview=None if resp.status_code == 200 else snippet(resp.text))
-
-        token, cookie_name = extract_token(session)
+                  token=mask(token), jwt=jwt_info(token) if token else None,
+                  error=None if ok else "user_auth cookie/accessToken nahi mila "
+                                        "(IP block ya site ne guest cookie dena band kiya)")
         if not token:
-            trace.add(f"{n}.token.cookie", False,
-                      error=f"{n}: kisi cookie me accessToken nahi mila "
-                            f"(server IP block ya site ne guest cookie dena band kiya)",
-                      cookies_received=sorted(session.cookies.keys()))
-            return None
-
-        TOKEN_CACHE[n] = {"token": token, "expires_at": now + 3600}
-        trace.add(f"{n}.token.parse", True, token=mask(token), cookie=cookie_name)
-        return token
-
+            return None, None
+        ttl = 600
+        exp_in = jwt_info(token).get("exp_in_s")
+        if isinstance(exp_in, int):
+            ttl = max(0, min(ttl, exp_in - 60))
+        GUEST.update({"token": token, "client_id": client_id, "expires_at": now + ttl})
+        return token, client_id
     except Exception as e:
-        trace.add(f"{n}.token.exception", False, error=f"{type(e).__name__}: {e}")
-        log.error("Token fetch error (%s): %s", n, e)
+        trace.add("guest.exception", False, error=f"{type(e).__name__}: {e}")
+        return None, None
+
+
+def get_account_token(trace):
+    """Optional fallback: logged-in account ka token, sirf env var se."""
+    raw = (os.environ.get("ROOTER_TOKEN") or "").strip()
+    if not raw:
         return None
+    if raw.startswith(("{", "%7B", "%7b")):
+        raw = _token_from_cookie_value(raw) or ""
+    if not raw:
+        trace.add("account.token", False, error="ROOTER_TOKEN parse nahi hua")
+        return None
+    info = jwt_info(raw)
+    trace.add("account.token", True, token=mask(raw), jwt=info)
+    if isinstance(info.get("exp_in_s"), int) and info["exp_in_s"] <= 0:
+        trace.add("account.expired", False,
+                  error="ROOTER_TOKEN expire ho chuka hai - dobara login karke naya daalo")
+        return None
+    return raw
 
 
 # ======================================================================
-# Username (rooter)
+# Validate (username lookup)
 # ======================================================================
 def api_error(resp):
-    """Rooter ke error body se asli message nikalo."""
     try:
         j = resp.json()
-        err = j.get("error") or j.get("data") or {}
-        return (f"rooter error: {j.get('message')} | statusCode={err.get('statusCode')} | "
-                f"{err.get('developerMessage') or j.get('developerMessage')}")
+        return snippet(json.dumps(j), 250)
     except Exception:
-        return f"HTTP {resp.status_code}"
+        return f"HTTP {resp.status_code}: {snippet(resp.text, 150)}"
 
 
-def fetch_username_from_site(uid, trace, site):
-    n = site["name"]
-    session = requests.Session()
-    token = get_authorization_token(session, trace, site)
-    if not token:
-        return None
-
-    url = f"https://bazaar.rooter.io/order/getUnipinUsername?gameCode=BGMI_IN&id={uid}"
+def call_validate(uid, token, client_id, label, trace):
+    """Return (state, username).  state: ok | invalid_player | auth_failed | error"""
     headers = {
         "Authorization": f"Bearer {token}",
-        "Device-Type": "web",
-        "App-Version": "1.0.0",
-        "Device-Id": "api-service",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "device-type": "web",
+        "device-category": "mobile",
+        "app-version": "1.0.0",
+        "device-id": DEVICE_ID,
+        "x-s-country-code": "IN",
+        "country-code": "IN",
+        "x-language-code": "en",
         "User-Agent": UA,
-        "Accept": "application/json",
-        "Origin": site["origin"],
-        "Referer": site["referer"],
+        "Origin": ORIGIN,
+        "Referer": REFERER,
     }
+    if client_id:
+        headers["x-client-id"] = client_id
+    body = {"playerId": uid, "productId": PRODUCT_ID,
+            "sellerId": SELLER_ID, "variationId": VARIATION_ID}
 
-    def call():
-        return session.get(url, headers=headers, timeout=15)
+    def post():
+        return requests.post(VALIDATE_URL, headers=headers, json=body, timeout=15)
 
     try:
-        resp = call()
-        trace.add(f"{n}.username.request", resp.status_code == 200, url=url,
-                  status=resp.status_code, content_type=resp.headers.get("Content-Type"),
-                  blocked_hints=looks_blocked(resp) or None,
-                  error=None if resp.status_code == 200 else api_error(resp),
-                  body_preview=snippet(resp.text))
-
-        # 499 / 5xx = rooter ka upstream error, ek baar retry
-        if resp.status_code == 499 or resp.status_code >= 500:
+        resp = post()
+        if resp.status_code >= 500:  # upstream hiccup, ek retry
+            trace.add(f"validate.{label}.upstream_error", False,
+                      status=resp.status_code, error=api_error(resp))
             time.sleep(1.5)
-            resp = call()
-            trace.add(f"{n}.username.retry_upstream", resp.status_code == 200,
-                      status=resp.status_code,
-                      error=None if resp.status_code == 200 else api_error(resp),
-                      body_preview=snippet(resp.text))
+            resp = post()
 
-        # Token expire / invalid -> refresh once and retry
+        blocked = looks_blocked(resp)
         if resp.status_code in (401, 403):
-            token = get_authorization_token(session, trace, site, force_refresh=True)
-            if not token:
-                return None
-            headers["Authorization"] = f"Bearer {token}"
-            resp = call()
-            trace.add(f"{n}.username.retry_token", resp.status_code == 200,
-                      status=resp.status_code, body_preview=snippet(resp.text))
+            trace.add(f"validate.{label}", False, status=resp.status_code,
+                      blocked_hints=blocked or None, error=api_error(resp))
+            return "auth_failed", None
+        if resp.status_code not in (200, 201):
+            trace.add(f"validate.{label}", False, status=resp.status_code,
+                      blocked_hints=blocked or None, error=api_error(resp))
+            return "error", None
 
         try:
             data = resp.json()
         except Exception as e:
-            trace.add(f"{n}.username.json", False,
-                      error=f"Response JSON nahi hai: {e}", body_preview=snippet(resp.text))
-            return None
+            trace.add(f"validate.{label}", False, status=resp.status_code,
+                      error=f"JSON nahi hai: {e}", body_preview=snippet(resp.text))
+            return "error", None
 
-        transaction = data.get("transaction") if isinstance(data, dict) else None
-        if transaction == "SUCCESS":
-            username = (data.get("unipinRes") or {}).get("username")
-            trace.add(f"{n}.username.result", bool(username), username=username,
-                      error=None if username else "SUCCESS aaya par 'unipinRes.username' empty hai",
-                      raw=None if username else snippet(json.dumps(data), 400))
-            return username
+        if data.get("isValid") and data.get("username"):
+            trace.add(f"validate.{label}", True, status=resp.status_code,
+                      username=data["username"])
+            return "ok", data["username"]
 
-        trace.add(f"{n}.username.result", False,
-                  error=f"{n}: SUCCESS nahi mila (transaction={transaction!r})",
-                  raw=snippet(json.dumps(data), 400))
+        trace.add(f"validate.{label}", False, status=resp.status_code,
+                  error="isValid=false (player ID galat/nahi mila)",
+                  raw=snippet(json.dumps(data), 300))
+        return "invalid_player", None
     except Exception as e:
-        trace.add(f"{n}.username.exception", False, error=f"{type(e).__name__}: {e}")
-        log.error("Username fetch error (%s) for %s: %s", n, uid, e)
-    return None
+        trace.add(f"validate.{label}.exception", False, error=f"{type(e).__name__}: {e}")
+        return "error", None
 
 
 def fetch_username(uid, trace):
-    """Sab SITES try karo. Jo pehle chale uska username return. probe=1 me sab try hote hain."""
-    found = None
-    for site in SITES:
-        username = fetch_username_from_site(uid, trace, site)
-        if username:
-            trace.add("username.source", True, site=site["name"], username=username)
-            found = found or username
-            if not getattr(trace, "try_all", False):
-                break
-    return found
+    """Return (username, state)."""
+    # 1) guest token
+    token, client_id = get_guest_token(trace)
+    if token:
+        state, username = call_validate(uid, token, client_id, "guest", trace)
+        if state in ("ok", "invalid_player"):
+            return username, state
+        if state == "auth_failed":
+            # cache ka token purana ho sakta hai, ek baar fresh lo
+            token, client_id = get_guest_token(trace, force=True)
+            if token:
+                state, username = call_validate(uid, token, client_id, "guest_fresh", trace)
+                if state in ("ok", "invalid_player"):
+                    return username, state
+
+    # 2) logged-in account fallback (optional)
+    acct = get_account_token(trace)
+    if acct:
+        trace.add("fallback.account", True, note="guest fail, ROOTER_TOKEN try ho raha hai")
+        state, username = call_validate(uid, acct, client_id if token else None, "account", trace)
+        return username, state
+
+    return None, "error"
 
 
 # ======================================================================
-# Get Player Info
+# Player info
 # ======================================================================
 def get_player_info(uid, trace, use_cache=True):
     now = time.time()
     if use_cache and uid in USER_CACHE and now - USER_CACHE[uid]["timestamp"] < CACHE_TTL:
         trace.add("cache.hit", True, uid=uid)
-        return USER_CACHE[uid]["data"]
+        return USER_CACHE[uid]["data"], 200
     trace.add("cache.miss", True, uid=uid)
 
-    username = fetch_username(uid, trace)
+    username, state = fetch_username(uid, trace)
 
-    if not username:
-        # Fail ko cache NAHI karte, warna 5 minute tak galat "Unknown" milta rahega
-        fail = trace.first_failure()
-        return {
-            "success": False,
-            "uid": uid,
-            "error": "Username fetch nahi ho paya",
-            "reason": fail.get("error") if fail else "unknown",
-            "failed_step": fail["step"] if fail else None,
-            "hint": "Debug ke liye URL me &debug=1 lagao ya /api/debug?uid=<UID> kholo",
-        }
+    if username:
+        result = {"success": True, "username": username, "uid": uid,
+                  "server": "BGMI", "region": "India"}
+        USER_CACHE[uid] = {"data": result, "timestamp": now}
+        return result, 200
 
-    result = {
-        "success": True,
-        "username": username,
+    if state == "invalid_player":
+        return {"success": False, "uid": uid, "error": "Player ID invalid ya nahi mila"}, 404
+
+    fail = trace.first_failure()
+    return {
+        "success": False,
         "uid": uid,
-        "server": "BGMI",
-        "region": "India",  # BGMI_IN = India server
-        
-    }
-    USER_CACHE[uid] = {"data": result, "timestamp": now}
-    return result
+        "error": "Username fetch nahi ho paya",
+        "reason": fail.get("error") if fail else "unknown",
+        "failed_step": fail["step"] if fail else None,
+        "hint": "Debug ke liye &debug=1&key=<DEBUG_KEY> lagao",
+    }, 502
 
 
 # ======================================================================
-# Debug access control
+# Debug access (DEBUG_KEY set na ho to debug band)
 # ======================================================================
 def debug_allowed():
-    if not DEBUG_KEY:
-        return True
-    return request.args.get("key") == DEBUG_KEY
+    return bool(DEBUG_KEY) and request.args.get("key") == DEBUG_KEY
 
 
 def check_host(url):
-    """Connectivity check for one host."""
     t = time.time()
     try:
         r = requests.get(url, headers={"User-Agent": UA}, timeout=8)
@@ -340,12 +368,9 @@ def check_host(url):
 # ======================================================================
 @app.route("/")
 def home():
-    return jsonify({
-        "service": "BGMI ID Info API",
-        "endpoint": "/api/bgmi?uid=<UID>",
-        "example": "/api/bgmi?uid=5120321397",
-        "debug": "/api/debug?uid=<UID>  or  /api/bgmi?uid=<UID>&debug=1",
-    })
+    return jsonify({"service": "BGMI ID Info API",
+                    "endpoint": "/api/bgmi?uid=<UID>",
+                    "example": "/api/bgmi?uid=5120321397"})
 
 
 @app.route("/health")
@@ -355,20 +380,18 @@ def health():
 
 @app.route("/api/bgmi", methods=["GET"])
 def bgmi_info():
-    uid = request.args.get("uid")
+    uid = (request.args.get("uid") or "").strip()
     if not uid:
         return jsonify({"success": False, "error": "Missing 'uid' parameter"}), 400
-    if not uid.isdigit():
+    if not uid.isdigit() or len(uid) > 15:
         return jsonify({"success": False, "error": "UID must be numeric"}), 400
 
     want_debug = request.args.get("debug") in ("1", "true", "yes")
     if want_debug and not debug_allowed():
-        return jsonify({"success": False, "error": "Invalid or missing debug key"}), 403
+        return jsonify({"success": False, "error": "Debug band hai ya key galat hai"}), 403
 
     trace = Trace()
-    data = get_player_info(uid, trace, use_cache=not want_debug)
-    status = 200 if data.get("success") else 502
-
+    data, status = get_player_info(uid, trace, use_cache=not want_debug)
     if want_debug:
         data = dict(data)
         data["debug"] = trace.to_dict()
@@ -378,16 +401,14 @@ def bgmi_info():
 @app.route("/api/debug", methods=["GET"])
 def debug_endpoint():
     if not debug_allowed():
-        return jsonify({"success": False, "error": "Invalid or missing debug key"}), 403
+        return jsonify({"success": False, "error": "Debug band hai ya key galat hai"}), 403
 
     uid = request.args.get("uid", "5120321397")
     if not uid.isdigit():
         return jsonify({"success": False, "error": "UID must be numeric"}), 400
 
     trace = Trace()
-    trace.try_all = request.args.get("probe", "1") != "0"  # debug me default sab sites try
-    result = get_player_info(uid, trace, use_cache=False)
-
+    result, _ = get_player_info(uid, trace, use_cache=False)
     return jsonify({
         "uid": uid,
         "result": result,
@@ -397,26 +418,23 @@ def debug_endpoint():
             "vercel": bool(os.environ.get("VERCEL")),
             "vercel_region": os.environ.get("VERCEL_REGION"),
             "requests": requests.__version__,
-            "flask_import_ok": True,
-            "debug_key_set": bool(DEBUG_KEY),
+            "account_fallback_set": bool(os.environ.get("ROOTER_TOKEN")),
+            "device_id_fixed": bool(os.environ.get("DEVICE_ID")),
         },
         "cache": {
-            "tokens": {k: {"token": mask(v["token"]),
-                           "expires_in_s": max(0, int(v["expires_at"] - time.time()))}
-                       for k, v in TOKEN_CACHE.items()},
+            "guest_token": mask(GUEST.get("token")),
+            "guest_expires_in_s": max(0, int(GUEST.get("expires_at", 0) - time.time())),
             "users_cached": len(USER_CACHE),
         },
         "connectivity": [
             check_host("https://shop.rooter.gg/"),
-            check_host("https://www.rooter.gg/"),
-            check_host("https://bazaar.rooter.io/"),
+            check_host("https://shop.rooter.io/"),
         ],
     }), 200
 
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    """Koi bhi unexpected crash — JSON me saaf error, traceback sirf debug mode me."""
     log.exception("Unhandled error")
     body = {"success": False, "error": f"{type(e).__name__}: {e}"}
     if request.args.get("debug") in ("1", "true", "yes") and debug_allowed():
@@ -424,7 +442,6 @@ def handle_exception(e):
     return jsonify(body), 500
 
 
-# ---------- Local Development ----------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))
     app.run(host="0.0.0.0", port=port, debug=False)
